@@ -144,6 +144,11 @@ typedef struct _fade {
 typedef struct _opacity_rule {
   struct _opacity_rule *next;
   double opacity;
+  double active_opacity;
+  double inactive_opacity;
+  Bool has_opacity;
+  Bool has_active;
+  Bool has_inactive;
   char *class_i;
   char *class_g;
 } opacity_rule;
@@ -214,11 +219,23 @@ invalidate_wm_class_cache(win *w);
 static void
 add_class_opacity(const char *spec);
 static void
+add_class_active_opacity(const char *spec);
+static void
+add_class_inactive_opacity(const char *spec);
+static void
 do_configure_win(Display *dpy, win* w);
 static void
 set_paint_ignore_region_dirty(void);
 static void
 set_opacity(Display *dpy, win *w, unsigned long opacity);
+static void
+apply_configured_opacity(Display *dpy, win *w);
+static void
+apply_opacity_to_all_windows(Display *dpy);
+static Bool
+read_active_window_property(Display *dpy, Window *result);
+static void
+handle_active_window_change(Display *dpy, Window new_active);
 
 static XserverRegion
 win_extents(Display *dpy, win *w);
@@ -236,6 +253,12 @@ Bool fade_trans = False;
 
 double inactive_opacity = 0;
 double frame_opacity = 0;
+static double active_opacity = 1.0;
+static Bool active_opacity_enabled = False;
+static Bool focus_tracking_enabled = False;
+static Bool active_window_known = False;
+static Window current_active_window = None;
+static Atom atom_net_active_window;
 
 #define INACTIVE_OPACITY \
 (unsigned long)((double)inactive_opacity * OPAQUE)
@@ -1609,6 +1632,86 @@ get_opacity_prop(Display *dpy, win *w, unsigned int def) {
 }
 
 static void
+apply_configured_opacity(Display *dpy, win *w) {
+  if (!w || w->destroyed) return;
+  double def = get_configured_opacity(dpy, w);
+  unsigned long opacity = get_opacity_prop(
+    dpy, w, (unsigned long)(OPAQUE * def));
+  set_opacity(dpy, w, opacity);
+}
+
+static void
+apply_opacity_to_all_windows(Display *dpy) {
+  for (win *w = list; w; w = w->next) {
+    if (w->destroyed) continue;
+    apply_configured_opacity(dpy, w);
+  }
+}
+
+static Bool
+read_active_window_property(Display *dpy, Window *result) {
+  if (!result || !atom_net_active_window) return False;
+
+  Atom actual_type = None;
+  int actual_format = 0;
+  unsigned long nitems = 0;
+  unsigned long bytes_after = 0;
+  unsigned char *data = NULL;
+  Bool success = False;
+
+  if (XGetWindowProperty(
+        dpy, root, atom_net_active_window,
+        0L, 1L, False, XA_WINDOW,
+        &actual_type, &actual_format,
+        &nitems, &bytes_after, &data) == Success) {
+    if (actual_type == XA_WINDOW
+        && actual_format == 32 && nitems >= 1) {
+      Window active = ((Window *)data)[0];
+      *result = active;
+      success = True;
+    }
+  }
+
+  if (data) {
+    XFree(data);
+  }
+
+  return success;
+}
+
+static void
+handle_active_window_change(Display *dpy, Window new_active) {
+  if (!focus_tracking_enabled) return;
+
+  Bool had_known = active_window_known;
+  Window old_active = current_active_window;
+
+  if (had_known && old_active == new_active) {
+    return;
+  }
+
+  active_window_known = True;
+  current_active_window = new_active;
+
+  if (!had_known || !new_active) {
+    apply_opacity_to_all_windows(dpy);
+    return;
+  }
+
+  if (old_active && old_active != new_active) {
+    win *old = find_win(dpy, old_active);
+    if (old) {
+      apply_configured_opacity(dpy, old);
+    }
+  }
+
+  win *now = find_win(dpy, new_active);
+  if (now) {
+    apply_configured_opacity(dpy, now);
+  }
+}
+
+static void
 invalidate_wm_class_cache(win *w) {
   if (!w) return;
   if (w->class_instance) {
@@ -1657,6 +1760,7 @@ ensure_win_class(Display *dpy, win *w) {
 static double
 get_configured_opacity(Display *dpy, win *w) {
   double configured = win_type_opacity[w->window_type];
+  opacity_rule *matched_rule = NULL;
 
   if (opacity_rules && w) {
     if (ensure_win_class(dpy, w)) {
@@ -1676,8 +1780,43 @@ get_configured_opacity(Display *dpy, win *w) {
             continue;
           }
         }
-        configured = rule->opacity;
+        matched_rule = rule;
+        if (rule->has_opacity) {
+          configured = rule->opacity;
+        }
         break;
+      }
+    }
+  }
+
+  double rule_base = configured;
+
+  if (focus_tracking_enabled && active_window_known && w
+      && IS_NORMAL_WIN(w)) {
+    Bool is_active = (current_active_window != None
+        && current_active_window == w->id);
+
+    if (matched_rule) {
+      if (is_active) {
+        if (matched_rule->has_active) {
+          configured = matched_rule->active_opacity;
+        } else {
+          configured = rule_base;
+        }
+      } else {
+        if (matched_rule->has_inactive) {
+          configured = matched_rule->inactive_opacity;
+        } else {
+          configured = rule_base;
+        }
+      }
+    } else {
+      if (is_active) {
+        if (active_opacity_enabled) {
+          configured = active_opacity;
+        }
+      } else if (inactive_opacity) {
+        configured = inactive_opacity;
       }
     }
   }
@@ -2045,6 +2184,11 @@ destroy_callback(Display *dpy, win *w) {
 
 static void
 destroy_win(Display *dpy, Window id, Bool fade) {
+  if (focus_tracking_enabled && active_window_known
+      && current_active_window == id) {
+    handle_active_window_change(dpy, None);
+  }
+
   win *w = find_win(dpy, id);
 
   if (w) w->destroyed = True;
@@ -2327,34 +2471,84 @@ parse_opacity_value(const char *text, double *result) {
   return True;
 }
 
-static void
-append_opacity_rule(opacity_rule *rule) {
-  if (!rule) return;
+typedef enum {
+  CLASS_RULE_DEFAULT,
+  CLASS_RULE_ACTIVE,
+  CLASS_RULE_INACTIVE,
+} class_rule_kind;
+
+static Bool
+class_name_equals(const char *a, const char *b) {
+  if (a == b) return True;
+  if (!a || !b) return False;
+  return strcmp(a, b) == 0;
+}
+
+static opacity_rule *
+ensure_class_rule(const char *class_g, const char *class_i) {
+  if (!class_g || !*class_g) return NULL;
+
+  opacity_rule *prev = NULL;
+  for (opacity_rule *rule = opacity_rules; rule; rule = rule->next) {
+    if (class_name_equals(rule->class_g, class_g)
+        && class_name_equals(rule->class_i, class_i)) {
+      return rule;
+    }
+    prev = rule;
+  }
+
+  opacity_rule *rule = calloc(1, sizeof(*rule));
+  if (!rule) {
+    fprintf(stderr,
+      "fastcompmgr: failed to allocate memory for class rule '%s'\n",
+      class_g);
+    return NULL;
+  }
+
+  rule->class_g = strdup(class_g);
+  if (class_i && *class_i) {
+    rule->class_i = strdup(class_i);
+  }
+
+  if (!rule->class_g || (class_i && *class_i && !rule->class_i)) {
+    fprintf(stderr,
+      "fastcompmgr: failed to allocate memory for class rule '%s'\n",
+      class_g);
+    free(rule->class_g);
+    free(rule->class_i);
+    free(rule);
+    return NULL;
+  }
+
   if (!opacity_rules) {
     opacity_rules = rule;
   } else {
-    opacity_rule *tail = opacity_rules;
-    while (tail->next) {
-      tail = tail->next;
-    }
-    tail->next = rule;
+    prev->next = rule;
   }
+  return rule;
 }
 
-static void
-add_class_opacity(const char *spec) {
-  if (!spec) return;
+static Bool
+parse_class_rule_spec(const char *option_name, const char *spec,
+                      char **out_class_g, char **out_class_i,
+                      double *out_opacity) {
+  if (!spec || !out_class_g || !out_class_i || !out_opacity) {
+    return False;
+  }
+
+  *out_class_g = NULL;
+  *out_class_i = NULL;
 
   char *buffer = strdup(spec);
-  if (!buffer) return;
+  if (!buffer) return False;
 
   char *eq = strchr(buffer, '=');
   if (!eq) {
     fprintf(stderr,
-      "fastcompmgr: invalid class-opacity '%s' (missing '=')\n",
-      spec);
+      "fastcompmgr: invalid %s '%s' (missing '=')\n",
+      option_name, spec);
     free(buffer);
-    return;
+    return False;
   }
 
   *eq = '\0';
@@ -2363,19 +2557,19 @@ add_class_opacity(const char *spec) {
 
   if (!*class_spec || !*value_spec) {
     fprintf(stderr,
-      "fastcompmgr: invalid class-opacity '%s' (empty section)\n",
-      spec);
+      "fastcompmgr: invalid %s '%s' (empty section)\n",
+      option_name, spec);
     free(buffer);
-    return;
+    return False;
   }
 
   double opacity;
   if (!parse_opacity_value(value_spec, &opacity)) {
     fprintf(stderr,
-      "fastcompmgr: invalid opacity '%s' in class-opacity '%s'\n",
-      value_spec, spec);
+      "fastcompmgr: invalid opacity '%s' in %s '%s'\n",
+      value_spec, option_name, spec);
     free(buffer);
-    return;
+    return False;
   }
 
   char *instance = strchr(class_spec, '.');
@@ -2390,37 +2584,90 @@ add_class_opacity(const char *spec) {
 
   if (!*class_g) {
     fprintf(stderr,
-      "fastcompmgr: missing class name in class-opacity '%s'\n",
-      spec);
+      "fastcompmgr: missing class name in %s '%s'\n",
+      option_name, spec);
     free(buffer);
-    return;
+    return False;
   }
 
-  opacity_rule *rule = calloc(1, sizeof(*rule));
-  if (!rule) {
-    free(buffer);
-    return;
-  }
-
-  rule->opacity = opacity;
-  rule->class_g = strdup(class_g);
+  *out_class_g = strdup(class_g);
   if (class_i && *class_i) {
-    rule->class_i = strdup(class_i);
+    *out_class_i = strdup(class_i);
   }
 
-  if ((class_i && !rule->class_i) || !rule->class_g) {
+  if (!*out_class_g || (class_i && *class_i && !*out_class_i)) {
     fprintf(stderr,
-      "fastcompmgr: failed to allocate memory for class-opacity '%s'\n",
-      spec);
-    free(rule->class_g);
-    free(rule->class_i);
-    free(rule);
+      "fastcompmgr: failed to allocate memory for %s '%s'\n",
+      option_name, spec);
+    free(*out_class_g);
+    *out_class_g = NULL;
+    free(*out_class_i);
+    *out_class_i = NULL;
     free(buffer);
+    return False;
+  }
+
+  *out_opacity = opacity;
+  free(buffer);
+  return True;
+}
+
+static void
+add_class_rule_entry(const char *spec,
+                     class_rule_kind kind,
+                     const char *option_name) {
+  if (!spec) return;
+
+  char *class_g = NULL;
+  char *class_i = NULL;
+  double opacity = 0.0;
+  if (!parse_class_rule_spec(option_name, spec, &class_g, &class_i, &opacity)) {
+    free(class_g);
+    free(class_i);
     return;
   }
 
-  append_opacity_rule(rule);
-  free(buffer);
+  opacity_rule *rule = ensure_class_rule(class_g, class_i);
+  if (!rule) {
+    free(class_g);
+    free(class_i);
+    return;
+  }
+
+  switch (kind) {
+    case CLASS_RULE_DEFAULT:
+      rule->opacity = opacity;
+      rule->has_opacity = True;
+      break;
+    case CLASS_RULE_ACTIVE:
+      rule->active_opacity = opacity;
+      rule->has_active = True;
+      focus_tracking_enabled = True;
+      break;
+    case CLASS_RULE_INACTIVE:
+      rule->inactive_opacity = opacity;
+      rule->has_inactive = True;
+      focus_tracking_enabled = True;
+      break;
+  }
+
+  free(class_g);
+  free(class_i);
+}
+
+static void
+add_class_opacity(const char *spec) {
+  add_class_rule_entry(spec, CLASS_RULE_DEFAULT, "class-opacity");
+}
+
+static void
+add_class_active_opacity(const char *spec) {
+  add_class_rule_entry(spec, CLASS_RULE_ACTIVE, "class-active-opacity");
+}
+
+static void
+add_class_inactive_opacity(const char *spec) {
+  add_class_rule_entry(spec, CLASS_RULE_INACTIVE, "class-inactive-opacity");
 }
 
 void
@@ -2468,6 +2715,14 @@ usage(char *program, int exitcode) {
     Green color value of shadow (0.0 - 1.0, defaults to 0).
     --shadow-blue value
     Blue color value of shadow (0.0 - 1.0, defaults to 0).
+    --active-opacity value
+    Opacity to apply to focused windows (0.0 - 1.0).
+    --inactive-opacity value
+    Same as -i (opacity of unfocused windows).
+    --class-active-opacity class[.instance]=opacity
+    Focused WM_CLASS-specific opacity override.
+    --class-inactive-opacity class[.instance]=opacity
+    Unfocused WM_CLASS-specific opacity override.
     --class-opacity class[.instance]=opacity
     Apply opacity to WM_CLASS, e.g. St=0.95 or St.st-floating=100.)SOMERANDOMTEXT"
   );
@@ -2584,6 +2839,10 @@ main(int argc, char **argv) {
     { "shadow-green", required_argument, NULL, 0 },
     { "shadow-blue", required_argument, NULL, 0 },
     { "class-opacity", required_argument, NULL, 0 },
+    { "class-active-opacity", required_argument, NULL, 0 },
+    { "class-inactive-opacity", required_argument, NULL, 0 },
+    { "active-opacity", required_argument, NULL, 0 },
+    { "inactive-opacity", required_argument, NULL, 0 },
     { "help", no_argument, NULL, 0 },
     { 0, 0, 0, 0 },
   };
@@ -2624,7 +2883,22 @@ main(int argc, char **argv) {
           case 1: shadow_green = normalize_d(atof(optarg)); break;
           case 2: shadow_blue = normalize_d(atof(optarg)); break;
           case 3: add_class_opacity(optarg); break;
-          case 4: usage(argv[0], 0); break;
+          case 4: add_class_active_opacity(optarg); break;
+          case 5: add_class_inactive_opacity(optarg); break;
+          case 6:
+            active_opacity = normalize_d(atof(optarg));
+            active_opacity_enabled = True;
+            focus_tracking_enabled = True;
+            break;
+          case 7:
+            inactive_opacity = (double)atof(optarg);
+            if (inactive_opacity > 0.0) {
+              focus_tracking_enabled = True;
+            } else {
+              inactive_opacity = 0.0;
+            }
+            break;
+          case 8: usage(argv[0], 0); break;
           default:
             fprintf(stderr, "Bug, unhandeled longopt_idx %d\n", longopt_idx);
             exit(2);
@@ -2691,6 +2965,11 @@ main(int argc, char **argv) {
         break;
       case 'i':
         inactive_opacity = (double)atof(optarg);
+        if (inactive_opacity > 0.0) {
+          focus_tracking_enabled = True;
+        } else {
+          inactive_opacity = 0.0;
+        }
         break;
       case 'e':
         frame_opacity = (double)atof(optarg);
@@ -2767,6 +3046,8 @@ main(int argc, char **argv) {
     "PIXMAP", False);
   atom_wm_state = XInternAtom(dpy,
     "WM_STATE", False);
+  atom_net_active_window = XInternAtom(dpy,
+    "_NET_ACTIVE_WINDOW", False);
   atom_net_frame_extents = XInternAtom(dpy,
     "_NET_FRAME_EXTENTS", False);
   atom_gtk_frame_extents = XInternAtom(dpy,
@@ -2799,6 +3080,14 @@ main(int argc, char **argv) {
     "_NET_WM_WINDOW_TYPE_COMBO", False);
   win_type[WINTYPE_DND] = XInternAtom(dpy,
     "_NET_WM_WINDOW_TYPE_DND", False);
+
+  if (focus_tracking_enabled) {
+    Window initial = None;
+    if (read_active_window_property(dpy, &initial)) {
+      active_window_known = True;
+      current_active_window = initial;
+    }
+  }
 
   gaussian_map = make_gaussian_map(dpy, shadow_radius);
   presum_gaussian(gaussian_map);
@@ -2879,7 +3168,7 @@ main(int argc, char **argv) {
 
       switch (ev.type) {
         case FocusIn: {
-          if (!inactive_opacity) break;
+          if (!focus_tracking_enabled) break;
 
           // stop focusing windows the cursor is over.
           // with this, windows dont focus right after being
@@ -2887,14 +3176,11 @@ main(int argc, char **argv) {
           // the right kind of FocusOut event
           if (ev.xfocus.detail == NotifyPointer) break;
 
-          win *fw = find_win(dpy, ev.xfocus.window);
-          if (IS_NORMAL_WIN(fw)) {
-            set_opacity(dpy, fw, OPAQUE);
-          }
+          handle_active_window_change(dpy, ev.xfocus.window);
           break;
         }
         case FocusOut: {
-          if (!inactive_opacity) break;
+          if (!focus_tracking_enabled) break;
 
           // this fixes deiconify refocus
           // need != notifygrab here otherwise windows wont
@@ -2902,9 +3188,9 @@ main(int argc, char **argv) {
           if (ev.xfocus.mode != NotifyGrab
               && ev.xfocus.detail == NotifyVirtual) break;
 
-          win *fw = find_win(dpy, ev.xfocus.window);
-          if (IS_NORMAL_WIN(fw)) {
-            set_opacity(dpy, fw, INACTIVE_OPACITY);
+          if (active_window_known
+              && current_active_window == ev.xfocus.window) {
+            handle_active_window_change(dpy, None);
           }
           break;
         }
@@ -2975,17 +3261,20 @@ main(int argc, char **argv) {
             /* reset mode and redraw window */
             win *w = find_win(dpy, ev.xproperty.window);
             if (w) {
-              double def = get_configured_opacity(dpy, w);
-              set_opacity(dpy, w,
-                get_opacity_prop(dpy, w, (unsigned long)(OPAQUE * def)));
+              apply_configured_opacity(dpy, w);
             }
           } else if (ev.xproperty.atom == XA_WM_CLASS) {
             win *w = find_win(dpy, ev.xproperty.window);
             if (w) {
               invalidate_wm_class_cache(w);
-              double def = get_configured_opacity(dpy, w);
-              set_opacity(dpy, w,
-                get_opacity_prop(dpy, w, (unsigned long)(OPAQUE * def)));
+              apply_configured_opacity(dpy, w);
+            }
+          } else if (focus_tracking_enabled
+              && ev.xproperty.atom == atom_net_active_window
+              && ev.xproperty.window == root) {
+            Window active;
+            if (read_active_window_property(dpy, &active)) {
+              handle_active_window_change(dpy, active);
             }
           }
           break;

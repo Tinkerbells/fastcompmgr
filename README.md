@@ -109,6 +109,14 @@ All options (currently fading doesn't work):
     Green color value of shadow (0.0 - 1.0, defaults to 0).
     --shadow-blue value
     Blue color value of shadow (0.0 - 1.0, defaults to 0).
+    --active-opacity value
+    Opacity to apply to focused windows (0.0 - 1.0).
+    --inactive-opacity value
+    Same as -i (opacity of unfocused windows).
+    --class-active-opacity class[.instance]=opacity
+    Focused WM_CLASS-specific opacity override.
+    --class-inactive-opacity class[.instance]=opacity
+    Unfocused WM_CLASS-specific opacity override.
     --class-opacity class[.instance]=opacity
     Apply opacity to windows that match WM_CLASS, e.g. St=0.95 or St.scratch=80.
 
@@ -117,6 +125,13 @@ All options (currently fading doesn't work):
 Multiple `--class-opacity` flags can be supplied. Each expects the WM_CLASS name
 (optionally followed by `.instance`) and an opacity (percentage or fraction).
 Rules are evaluated in the order given; the first match wins.
+
+When `-i/--inactive-opacity`, `--active-opacity`, or any of the class-specific
+focus flags are supplied, fastcompmgr tracks `_NET_ACTIVE_WINDOW` (with a FocusIn
+fallback). Class-based rules are evaluated first; if a rule defines
+`--class-active-opacity`/`--class-inactive-opacity`, those take precedence for
+that WM_CLASS. Otherwise, global active/inactive opacities are only applied when
+no class rule matched.
 
 
 ## License
