@@ -109,8 +109,14 @@ All options (currently fading doesn't work):
     Green color value of shadow (0.0 - 1.0, defaults to 0).
     --shadow-blue value
     Blue color value of shadow (0.0 - 1.0, defaults to 0).
+    --class-opacity class[.instance]=opacity
+    Apply opacity to windows that match WM_CLASS, e.g. St=0.95 or St.scratch=80.
 
 ~~~
+
+Multiple `--class-opacity` flags can be supplied. Each expects the WM_CLASS name
+(optionally followed by `.instance`) and an opacity (percentage or fraction).
+Rules are evaluated in the order given; the first match wins.
 
 
 ## License

@@ -21,6 +21,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <getopt.h>
+#include <ctype.h>
 
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
@@ -120,6 +121,9 @@ typedef struct _win {
   /* for drawing translucent windows */
   XserverRegion border_clip;
   struct _win *prev_trans;
+  Bool class_fetched;
+  char *class_instance;
+  char *class_general;
 } win;
 
 typedef struct _conv {
@@ -136,6 +140,13 @@ typedef struct _fade {
   void (*callback) (Display *dpy, win *w);
   Display *dpy;
 } fade;
+
+typedef struct _opacity_rule {
+  struct _opacity_rule *next;
+  double opacity;
+  char *class_i;
+  char *class_g;
+} opacity_rule;
 
 win *list;
 fade *fades;
@@ -165,6 +176,7 @@ Atom win_type[NUM_WINTYPES];
 double win_type_opacity[NUM_WINTYPES];
 Bool win_type_shadow[NUM_WINTYPES];
 Bool win_type_fade[NUM_WINTYPES];
+static opacity_rule *opacity_rules;
 
 #define REGISTER_PROP "_NET_WM_CM_S"
 
@@ -193,10 +205,20 @@ is_gtk_frame_extent(Display *dpy, Window w);
 
 static double
 get_opacity_percent(Display *dpy, win *w);
+static double
+get_configured_opacity(Display *dpy, win *w);
+static Bool
+ensure_win_class(Display *dpy, win *w);
+static void
+invalidate_wm_class_cache(win *w);
+static void
+add_class_opacity(const char *spec);
 static void
 do_configure_win(Display *dpy, win* w);
 static void
 set_paint_ignore_region_dirty(void);
+static void
+set_opacity(Display *dpy, win *w, unsigned long opacity);
 
 static XserverRegion
 win_extents(Display *dpy, win *w);
@@ -1426,6 +1448,7 @@ static void
 map_win(Display *dpy, Window id,
         unsigned long sequence, Bool fade) {
   win *w = find_win(dpy, id);
+  double target_opacity;
 
   if (unlikely(!w)) return;
 
@@ -1457,10 +1480,13 @@ map_win(Display *dpy, Window id,
   w->damaged = 0;
   w->paint_needed = True;
 
+  target_opacity = get_opacity_percent(dpy, w);
   if (fade && win_type_fade[w->window_type]) {
     set_fade(
-      dpy, w, 0, get_opacity_percent(dpy, w),
+      dpy, w, 0, target_opacity,
       fade_in_step, 0, True, True);
+  } else {
+    set_opacity(dpy, w, (unsigned long)(target_opacity * OPAQUE));
   }
 
   set_paint_ignore_region_dirty();
@@ -1582,6 +1608,85 @@ get_opacity_prop(Display *dpy, win *w, unsigned int def) {
   return def;
 }
 
+static void
+invalidate_wm_class_cache(win *w) {
+  if (!w) return;
+  if (w->class_instance) {
+    free(w->class_instance);
+    w->class_instance = NULL;
+  }
+  if (w->class_general) {
+    free(w->class_general);
+    w->class_general = NULL;
+  }
+  w->class_fetched = False;
+}
+
+static Bool
+ensure_win_class(Display *dpy, win *w) {
+  if (!w) return False;
+
+  if (w->class_fetched) {
+    return (w->class_instance && *w->class_instance)
+      || (w->class_general && *w->class_general);
+  }
+
+  invalidate_wm_class_cache(w);
+
+  XClassHint hint;
+  if (XGetClassHint(dpy, w->id, &hint)) {
+    if (hint.res_name && *hint.res_name) {
+      w->class_instance = strdup(hint.res_name);
+    }
+    if (hint.res_class && *hint.res_class) {
+      w->class_general = strdup(hint.res_class);
+    }
+    if (hint.res_name) {
+      XFree(hint.res_name);
+    }
+    if (hint.res_class) {
+      XFree(hint.res_class);
+    }
+  }
+
+  w->class_fetched = True;
+  return (w->class_instance && *w->class_instance)
+    || (w->class_general && *w->class_general);
+}
+
+static double
+get_configured_opacity(Display *dpy, win *w) {
+  double configured = win_type_opacity[w->window_type];
+
+  if (opacity_rules && w) {
+    if (ensure_win_class(dpy, w)) {
+      opacity_rule *rule = opacity_rules;
+      while (rule) {
+        if (rule->class_g) {
+          if (!w->class_general
+              || strcmp(rule->class_g, w->class_general) != 0) {
+            rule = rule->next;
+            continue;
+          }
+        }
+        if (rule->class_i) {
+          if (!w->class_instance
+              || strcmp(rule->class_i, w->class_instance) != 0) {
+            rule = rule->next;
+            continue;
+          }
+        }
+        configured = rule->opacity;
+        break;
+      }
+    }
+  }
+
+  if (configured < 0.0) configured = 0.0;
+  if (configured > 1.0) configured = 1.0;
+  return configured;
+}
+
 /*
  * Get the opacity property from the window in a percent format
  * not found: default
@@ -1590,7 +1695,7 @@ get_opacity_prop(Display *dpy, win *w, unsigned int def) {
 
 static double
 get_opacity_percent(Display *dpy, win *w) {
-  double def = win_type_opacity[w->window_type];
+  double def = get_configured_opacity(dpy, w);
   unsigned int opacity =
     get_opacity_prop(dpy, w, (unsigned int)(OPAQUE * def));
 
@@ -1924,6 +2029,7 @@ finish_destroy_win(Display *dpy, Window id) {
         XFixesDestroyRegion(dpy, w->extents);
         w->extents = None;
       }
+      invalidate_wm_class_cache(w);
       free(w);
       break;
     }
@@ -2173,6 +2279,150 @@ ev_window(XEvent *ev) {
 }
 #endif
 
+static char *
+trim_whitespace(char *str) {
+  if (!str) return str;
+  while (*str && isspace((unsigned char)*str)) {
+    str++;
+  }
+  char *end = str + strlen(str);
+  while (end > str && isspace((unsigned char)*(end - 1))) {
+    --end;
+  }
+  *end = '\0';
+  return str;
+}
+
+static Bool
+parse_opacity_value(const char *text, double *result) {
+  if (!text || !*text || !result) return False;
+
+  char *endptr = NULL;
+  double opacity = strtod(text, &endptr);
+  if (endptr == text) {
+    return False;
+  }
+
+  while (*endptr && isspace((unsigned char)*endptr)) {
+    ++endptr;
+  }
+
+  if (*endptr == '%') {
+    ++endptr;
+  } else if (opacity > 1.0) {
+    opacity /= 100.0;
+  }
+
+  while (*endptr && isspace((unsigned char)*endptr)) {
+    ++endptr;
+  }
+
+  if (*endptr) {
+    return False;
+  }
+
+  if (opacity < 0.0) opacity = 0.0;
+  if (opacity > 1.0) opacity = 1.0;
+  *result = opacity;
+  return True;
+}
+
+static void
+append_opacity_rule(opacity_rule *rule) {
+  if (!rule) return;
+  if (!opacity_rules) {
+    opacity_rules = rule;
+  } else {
+    opacity_rule *tail = opacity_rules;
+    while (tail->next) {
+      tail = tail->next;
+    }
+    tail->next = rule;
+  }
+}
+
+static void
+add_class_opacity(const char *spec) {
+  if (!spec) return;
+
+  char *buffer = strdup(spec);
+  if (!buffer) return;
+
+  char *eq = strchr(buffer, '=');
+  if (!eq) {
+    fprintf(stderr,
+      "fastcompmgr: invalid class-opacity '%s' (missing '=')\n",
+      spec);
+    free(buffer);
+    return;
+  }
+
+  *eq = '\0';
+  char *class_spec = trim_whitespace(buffer);
+  char *value_spec = trim_whitespace(eq + 1);
+
+  if (!*class_spec || !*value_spec) {
+    fprintf(stderr,
+      "fastcompmgr: invalid class-opacity '%s' (empty section)\n",
+      spec);
+    free(buffer);
+    return;
+  }
+
+  double opacity;
+  if (!parse_opacity_value(value_spec, &opacity)) {
+    fprintf(stderr,
+      "fastcompmgr: invalid opacity '%s' in class-opacity '%s'\n",
+      value_spec, spec);
+    free(buffer);
+    return;
+  }
+
+  char *instance = strchr(class_spec, '.');
+  char *class_g = class_spec;
+  char *class_i = NULL;
+
+  if (instance) {
+    *instance = '\0';
+    class_i = trim_whitespace(instance + 1);
+  }
+  class_g = trim_whitespace(class_g);
+
+  if (!*class_g) {
+    fprintf(stderr,
+      "fastcompmgr: missing class name in class-opacity '%s'\n",
+      spec);
+    free(buffer);
+    return;
+  }
+
+  opacity_rule *rule = calloc(1, sizeof(*rule));
+  if (!rule) {
+    free(buffer);
+    return;
+  }
+
+  rule->opacity = opacity;
+  rule->class_g = strdup(class_g);
+  if (class_i && *class_i) {
+    rule->class_i = strdup(class_i);
+  }
+
+  if ((class_i && !rule->class_i) || !rule->class_g) {
+    fprintf(stderr,
+      "fastcompmgr: failed to allocate memory for class-opacity '%s'\n",
+      spec);
+    free(rule->class_g);
+    free(rule->class_i);
+    free(rule);
+    free(buffer);
+    return;
+  }
+
+  append_opacity_rule(rule);
+  free(buffer);
+}
+
 void
 usage(char *program, int exitcode) {
   fprintf(stderr, "%s v0.5\n", program);
@@ -2217,7 +2467,9 @@ usage(char *program, int exitcode) {
     --shadow-green value
     Green color value of shadow (0.0 - 1.0, defaults to 0).
     --shadow-blue value
-    Blue color value of shadow (0.0 - 1.0, defaults to 0).)SOMERANDOMTEXT"
+    Blue color value of shadow (0.0 - 1.0, defaults to 0).
+    --class-opacity class[.instance]=opacity
+    Apply opacity to WM_CLASS, e.g. St=0.95 or St.st-floating=100.)SOMERANDOMTEXT"
   );
   fprintf(stderr, "\n");
 
@@ -2331,6 +2583,7 @@ main(int argc, char **argv) {
     { "shadow-red", required_argument, NULL, 0 },
     { "shadow-green", required_argument, NULL, 0 },
     { "shadow-blue", required_argument, NULL, 0 },
+    { "class-opacity", required_argument, NULL, 0 },
     { "help", no_argument, NULL, 0 },
     { 0, 0, 0, 0 },
   };
@@ -2370,7 +2623,8 @@ main(int argc, char **argv) {
           case 0: shadow_red = normalize_d(atof(optarg)); break;
           case 1: shadow_green = normalize_d(atof(optarg)); break;
           case 2: shadow_blue = normalize_d(atof(optarg)); break;
-          case 3: usage(argv[0], 0); break;
+          case 3: add_class_opacity(optarg); break;
+          case 4: usage(argv[0], 0); break;
           default:
             fprintf(stderr, "Bug, unhandeled longopt_idx %d\n", longopt_idx);
             exit(2);
@@ -2721,7 +2975,15 @@ main(int argc, char **argv) {
             /* reset mode and redraw window */
             win *w = find_win(dpy, ev.xproperty.window);
             if (w) {
-              double def = win_type_opacity[w->window_type];
+              double def = get_configured_opacity(dpy, w);
+              set_opacity(dpy, w,
+                get_opacity_prop(dpy, w, (unsigned long)(OPAQUE * def)));
+            }
+          } else if (ev.xproperty.atom == XA_WM_CLASS) {
+            win *w = find_win(dpy, ev.xproperty.window);
+            if (w) {
+              invalidate_wm_class_cache(w);
+              double def = get_configured_opacity(dpy, w);
               set_opacity(dpy, w,
                 get_opacity_prop(dpy, w, (unsigned long)(OPAQUE * def)));
             }
